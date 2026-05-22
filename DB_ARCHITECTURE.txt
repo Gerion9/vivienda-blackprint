@@ -1,0 +1,581 @@
+# Blackprint DB — Architecture & Cross-Join Reference for LLMs
+
+> **Audience.** This document is written for any LLM (or human engineer) that needs to write SQL against the Blackprint production database, perform cross-joins between urban variables and geometries, or reason about the data layer that feeds the Site Score and any downstream territorial-intelligence product.
+>
+> **Source of truth.** Everything here is reverse-engineered from the production index generators (`Gen_IDX_*.py`) and aggregation scripts (`Agg_Site_Score.py`). If a query in this README disagrees with what the code does, the code wins — open a PR to fix the README.
+>
+> **Prime directive.** Every variable in this database is locked to space and (sometimes) time through one of three keys: `cvegeo` (geometry), `h3_index` (mobility), or the (`entity_code`, `municipality_code`, `locality_code`, `ageb_code`) tuple. **Master those three and you can join anything to anything.**
+
+---
+
+## 0. Connection contract
+
+```python
+DB = dict(
+    host     = "35.211.253.113",
+    port     = 5432,
+    database = "blackprint_db_prd",
+    user     = "josue_user",
+    password = "<see env>",   # BLACKPRINT_DB_PASSWORD in .env
+)
+```
+
+All production tables live in the **`presentation`** schema. Always fully qualify (`presentation.dim_xxx`). Do not assume `search_path`.
+
+Set a statement timeout on every connection — most cross-municipality queries finish in <60 s, but POI joins on national scope can hang:
+
+```python
+with conn.cursor() as cur:
+    cur.execute("SET statement_timeout = '120s'")
+conn.commit()
+```
+
+CRS conventions across the platform:
+- **EPSG:4326** — input/output, plotting, all `latitude`/`longitude` columns.
+- **EPSG:6372** — every metric calculation in México (areas, distances, buffers, centroids). Never compute distances in 4326.
+
+---
+
+## 1. The three join keys
+
+Every analytical question in this DB resolves to one of these three keys. Memorize them.
+
+### 1.1 `cvegeo` — INEGI geocode (the spine of the geometry layer)
+
+A `cvegeo` is a concatenated INEGI code. **Its length tells you the granularity:**
+
+| Length | Granularity | Composition (left → right) | Example |
+|--------|-------------|----------------------------|---------|
+| 2  | State (entidad) | `entidad`                                                            | `22` (Querétaro) |
+| 5  | Municipality    | `entidad` + `mun`                                                    | `22014` |
+| 9  | Locality        | `entidad` + `mun` + `loc`                                            | `220140001` |
+| 13 | AGEB            | `entidad` + `mun` + `loc` + `ageb`                                   | `2201400010132` |
+| 14 | Block (manzana) | `entidad` + `mun` + `loc` + `ageb` + `mza`                           | `22014000101320001` (no — 14 only when `ageb` is 4 chars) |
+
+> **Trap.** `ageb` is *not* always 4 characters; INEGI sometimes emits 4-char alphanumeric (e.g. `0132`). Don't `LPAD(ageb, 4)` blindly — read the column as-is and concatenate. The 14-digit `cvegeo` for blocks reproduces faithfully only because `ageb` is stored already-padded.
+
+The canonical block-level `cvegeo` reconstruction (used in every `Gen_IDX` for blocks) is:
+
+```sql
+LPAD(b.entidad::text, 2, '0') ||
+LPAD(b.mun::text,     3, '0') ||
+LPAD(b.loc::text,     4, '0') ||
+b.ageb                          ||
+LPAD(b.mza::text,     3, '0')
+```
+
+The AGEB-level `cvegeo` (used by `dim_spending_by_socioeconomic` joins) is the same minus `mza`:
+
+```sql
+LPAD(entity_code::text,       2, '0') ||
+LPAD(municipality_code::text, 3, '0') ||
+LPAD(locality_code::text,     4, '0') ||
+ageb_code
+```
+
+**Rule.** When joining a fact table to geometry, **build the cvegeo and join on it explicitly**. Do not guess that the fact table already has it.
+
+### 1.2 `h3_index` — Uber's H3 hex grid (the spine of the mobility layer)
+
+Mobility data does not live on INEGI geometries. It lives on **H3 resolution 10 hexagons** (~15,000 m² each). To turn mobility into a per-block (or per-AGEB) metric you must:
+
+1. Query mobility filtered by `cve_ent`.
+2. Convert each `h3_index` to a polygon using `h3.cell_to_boundary` (note: H3 returns `(lat, lon)` — flip to `(lon, lat)` for Shapely).
+3. Project to EPSG:6372.
+4. Spatial-overlay against your target geometry (block, AGEB, buffer).
+5. Weight each contribution by `area(intersection) / area(h3_cell)` so a block that only partially overlaps a hex doesn't double-count.
+
+Reference implementation: `Gen_IDX_trafficmobility.py`, sections ⑥–⑧. The intersection table is computed **once** per municipality and reused for every dimension (morning/afternoon/night × pedestrian/vehicle/stationary).
+
+> **Do not** point-in-polygon a hex centroid into a block. Hexes can be larger than blocks and you'll lose flow.
+
+### 1.3 The composite tuple `(entity_code, municipality_code, locality_code, ageb_code)`
+
+The spending table (`dim_spending_by_socioeconomic`) does not store `cvegeo`. It stores the four parts as separate columns. You either:
+
+- **Build the cvegeo in the SELECT** (preferred — robust, joinable):
+  ```sql
+  SELECT
+      LPAD(entity_code::text,       2, '0') ||
+      LPAD(municipality_code::text, 3, '0') ||
+      LPAD(locality_code::text,     4, '0') ||
+      ageb_code                                AS cvegeo_ageb,
+      ...
+  FROM presentation.dim_spending_by_socioeconomic
+  ```
+- **Filter on the parts** (faster for single-municipality queries — uses indexes):
+  ```sql
+  WHERE entity_code = 22 AND municipality_code = 14
+  ```
+
+The same trade-off applies elsewhere: when filtering, prefer `cve_ent` + `cve_mun` (string codes, never ambiguous). When joining, build the `cvegeo` explicitly.
+
+---
+
+## 2. Table catalog
+
+All tables in `presentation` schema. Granularity column tells you the join key length / type.
+
+### 2.1 `dim_mexico_geometries` — the geometry registry
+
+The single source of geometric truth. Every polygon in the platform comes from here.
+
+| Column | Type | Notes |
+|---|---|---|
+| `cvegeo` | text | Primary join key. Length determines granularity. |
+| `geometry_level` | text | `'state' | 'municipality' | 'locality' | 'ageb' | 'block'`. **Always filter on this.** |
+| `cve_ent` | text(2) | Padded state code. |
+| `cve_mun` | text(3) | Padded municipality code (only meaningful for granularities ≥ municipality). |
+| `cve_ageb` | text | Available at AGEB and block granularities. |
+| `geometry_coords_json` | json/text | The polygon, as nested coordinate arrays in EPSG:4326. Parse with `parse_coords_json` (see §6). |
+
+**Critical filter pattern.** Always pin `geometry_level` AND `cve_ent`. The table mixes all granularities and all states; without both filters you get cross-state polygons:
+
+```sql
+WHERE g.geometry_level = 'block' AND g.cve_ent = '22'
+```
+
+### 2.2 `dim_demographic_by_block_locality` — INEGI population (block grain)
+
+Source: INEGI Censo. One row per block (manzana).
+
+| Column | Notes |
+|---|---|
+| `entidad`, `mun`, `loc`, `ageb`, `mza` | Composite key. Build `cvegeo` from these (see §1.1). |
+| `nom_mun` | Human-readable municipality name. **Do not join on this** — it's not unique nationally (e.g. multiple "San Pedro"). Use `cve_ent` + filter on `nom_mun` for *display*, never as a join key without the entity disambiguator. |
+| `pobtot` | Total population. **Always include `pobtot IS NOT NULL`** — INEGI suppresses small blocks with `*` for confidentiality, which becomes NULL after type cast. |
+| `pob0_14`, `pob15_64`, `pob65_mas` | Age cohorts. |
+| `p_15a17` | 15–17 subset. Subtracted from `pob15_64` to get true adult count (see `Gen_IDX_targetmarket.py`). |
+| Many more cohort columns | See INEGI Censo docs. Treat unknown columns as 0 with `COALESCE(...,0)`. |
+
+**Suppression handling.** Cells suppressed by INEGI come through as `'*'`. Force-numeric them:
+```python
+df[col] = pd.to_numeric(df[col].replace("*", np.nan), errors="coerce").fillna(0)
+```
+
+### 2.3 `dim_socioeconomic_level_ageb_locality` — NSE income tier (AGEB grain)
+
+Source: AMAI estimates joined to INEGI AGEBs. One row per AGEB.
+
+| Column | Notes |
+|---|---|
+| `geo_code` | Equals the 13-char `cvegeo` of the AGEB. **Join key.** |
+| `ab`, `cplus`, `c`, `cminus`, `dplus`, `d`, `e` | Number of households in each NSE tier. Sum the columns the client cares about; `COALESCE(...,0)` because rural AGEBs may lack rows. |
+
+**Granularity mismatch warning.** This table is at AGEB grain. When joined to a block-grain table, all blocks within the same AGEB receive the same NSE values. That's fine for population-weighted aggregates but be explicit about it in any spec.
+
+Reference query (from `Gen_IDX_targetmarket.py`):
+```sql
+LEFT JOIN presentation.dim_socioeconomic_level_ageb_locality n
+    ON n.geo_code = g.cvegeo
+```
+The `LEFT` is intentional — blocks outside any AGEB-with-NSE-data should still appear (with 0).
+
+### 2.4 `dim_pois_dataplor` — Points of Interest (point grain)
+
+Source: Dataplor. One row per POI in México.
+
+| Column | Notes |
+|---|---|
+| `latitude`, `longitude` | EPSG:4326. Cast to `float` in the SELECT — they may arrive as numeric or text. |
+| `cve_ent` | Padded state code. |
+| `cve_mun` | Padded municipality code. **Use this to filter, not `nomgeo`.** |
+| `nomgeo` | Municipality name. Same disambiguation problem as §2.2 — only use for display or one-off exploration. |
+| `business_category` | Dataplor taxonomy (`'restaurant'`, `'school'`, `'pharmacy'`, `'butcher_shop'`, `'cheese_shop'`, ...). Filter with `IN (...)`. |
+| `chain_name` | Brand name OR one of `{None, 'None', '', 'NULL', 'n/a', ...}` for independents. **Always normalize the null-stand-ins** before counting chain size — see `compute_brand_weights` in `Gen_IDX_RetailGap.py`. |
+
+> **Anti-pattern alert.** `Gen_IDX_competencia.py` and `Gen_IDX_spatialcomp.py` filter POIs with `nomgeo = '{MUNICIPIO}'`. This breaks for ambiguous names ("San Pedro", "Hidalgo", "Juárez" exist as municipalities in many states). The robust filter, used in `Gen_IDX_RetailGap.py`, is `cve_ent = '{ent}' AND cve_mun = '{mun}'`. **Prefer `cve_ent` + `cve_mun` for any new query.**
+
+### 2.5 `dim_mobility_data_by_hour` — device pings, hour grain (H3 × hour × user-type)
+
+Source: Dataplor mobility / Cuebiq-style device pings, aggregated.
+
+| Column | Notes |
+|---|---|
+| `h3_index` | H3 resolution **10** cell. Fixed — do not assume otherwise. |
+| `cve_ent` | State code (filter dimension). |
+| `hour` | 0–23 integer. |
+| `tipo_usuario` | `'peaton' | 'vehiculo' | 'estacionario'`. Mapped to `pedestrian | vehicle | stationary` in code. |
+| `total_usuarios_unicos` | Unique device count for that (hex, hour, mode). |
+
+**Time bucketing convention** (locked in TMI spec):
+- `morning`   → `4 ≤ hour ≤ 11`
+- `afternoon` → `12 ≤ hour ≤ 17`
+- `night`     → `hour ∈ {18..23, 0..3}`
+
+### 2.6 `dim_mobility_data_by_day` — device pings, day grain
+
+Same as 2.5 but aggregated by day instead of hour. Use this for weekly/seasonal analyses; use 2.5 when the time-of-day matters (default for TMI).
+
+### 2.7 `dim_spending_by_socioeconomic` — ENIGH × NSE projected spending (AGEB × ENIGH-item grain)
+
+Source: ENIGH 2022 expenditure shares, applied to NSE-tier household counts per AGEB.
+
+| Column | Notes |
+|---|---|
+| `entity_code`, `municipality_code`, `locality_code`, `ageb_code` | Composite key — build `cvegeo` (13 chars) on the fly. |
+| `expenditure_code` | ENIGH item code (string, may have letters). E.g. `"011111"` (tortilla), `"011121"` (bread). |
+| `division_code`, `group_code` | Hierarchical ENIGH groupings. See `SPEND_GROUP_FILTER` in `Gen_IDX_RetailGap.py`. |
+| `ab_spending`, `cplus_spending`, ..., `e_spending` | One column per NSE tier. **Units: MXN per quarter.** Sum the columns for the client's target NSE. |
+
+**Two query modes:**
+
+1. **Item-exact** (preferred when you have specific ENIGH codes):
+   ```sql
+   AND expenditure_code IN ('011111', '011121')
+   ```
+2. **Group-level** (legacy fallback):
+   ```sql
+   AND division_code = '01' AND group_code IN ('011')   -- food staples
+   ```
+
+The full division/group taxonomy lives in `Gen_IDX_RetailGap.py` → `SPEND_GROUP_FILTER`. Don't redefine it.
+
+---
+
+## 3. The canonical join: block geometries with population
+
+This pattern appears verbatim in **every block-level Gen_IDX**. Memorize it.
+
+```sql
+SELECT
+    g.cvegeo,
+    g.geometry_coords_json AS geom_json,
+    b.pobtot,
+    b.pob0_14, b.pob15_64, b.pob65_mas
+FROM presentation.dim_demographic_by_block_locality b
+JOIN presentation.dim_mexico_geometries g
+    ON g.cvegeo = (
+        LPAD(b.entidad::text, 2, '0') ||
+        LPAD(b.mun::text,     3, '0') ||
+        LPAD(b.loc::text,     4, '0') ||
+        b.ageb                          ||
+        LPAD(b.mza::text,     3, '0')
+    )
+   AND g.geometry_level = 'block'
+   AND g.cve_ent        = '{ENTIDAD}'
+WHERE b.entidad = '{ENTIDAD}'
+  AND b.nom_mun = '{MUNICIPIO}'
+  AND b.pobtot  IS NOT NULL
+```
+
+Notes for any LLM generating SQL against this DB:
+- **Both filters on `cve_ent`** (in JOIN ON and in WHERE) are required — the JOIN side prunes geometry, the WHERE side prunes demographics. Postgres is smart enough to use either, but redundancy here is intentional and safe.
+- `nom_mun` is used as a *filter* not a *join* — it disambiguates within a single state.
+- `b.pobtot IS NOT NULL` removes INEGI-suppressed blocks **before** the join (keeps result tight).
+- For AGEB-level instead of block-level, drop the `LPAD(b.mza...)` term and set `g.geometry_level = 'ageb'`.
+
+---
+
+## 4. Cross-join playbook (copy-paste cases)
+
+These cases are templates. Each one shows the conceptual pattern, then a runnable SQL/Python fragment, then the failure modes.
+
+### Case A — "Population × NSE within a buffer of a candidate site"
+
+**Goal.** For a candidate `(lat, lon)`, compute the total target-NSE population within 500 m walking radius.
+
+**Pattern.** Block geometry → demographics → NSE (AGEB) → spatial filter via centroid distance.
+
+```sql
+WITH bloques AS (
+  SELECT
+      g.cvegeo,
+      g.geometry_coords_json     AS geom,
+      COALESCE(b.pob65_mas, 0)   AS pob_target,
+      COALESCE(n.cplus, 0)
+        + COALESCE(n.c,     0)
+        + COALESCE(n.cminus,0)   AS hh_target_nse
+  FROM presentation.dim_demographic_by_block_locality b
+  JOIN presentation.dim_mexico_geometries g
+      ON g.cvegeo = (LPAD(b.entidad::text,2,'0') || LPAD(b.mun::text,3,'0')
+                  || LPAD(b.loc::text,4,'0')     || b.ageb
+                  || LPAD(b.mza::text,3,'0'))
+     AND g.geometry_level = 'block' AND g.cve_ent = '22'
+  LEFT JOIN presentation.dim_socioeconomic_level_ageb_locality n
+      ON n.geo_code = LEFT(g.cvegeo, 13)        -- AGEB cvegeo = first 13 chars
+  WHERE b.entidad = '22' AND b.nom_mun = 'Querétaro' AND b.pobtot IS NOT NULL
+)
+SELECT * FROM bloques;
+```
+
+Then in Python:
+```python
+gdf = gpd.GeoDataFrame(df, geometry=df.geom.apply(parse_coords_json), crs="EPSG:4326")
+sitio = gpd.GeoSeries([Point(LON, LAT)], crs="EPSG:4326").to_crs("EPSG:6372").iloc[0]
+centroids_m = gdf.to_crs("EPSG:6372").geometry.centroid
+mask = centroids_m.distance(sitio) <= 500
+total_pob = gdf.loc[mask, "pob_target"].sum()
+total_hh  = gdf.loc[mask, "hh_target_nse"].sum()
+```
+
+**Failure modes.**
+- Joining `n.geo_code = g.cvegeo` (full 14 chars) — wrong. NSE is at AGEB. Use `LEFT(g.cvegeo, 13)`.
+- Distance in EPSG:4326 — degrees ≠ meters. Always reproject.
+
+### Case B — "Mobility flow at the block level (any time slice, any user type)"
+
+**Goal.** Pedestrian foot traffic in the morning, weighted onto blocks for a municipality.
+
+**Pattern.** Block geometry → buffer of centroid → overlay with H3 cells → weight contributions by intersection-area.
+
+Full implementation: `Gen_IDX_trafficmobility.py`. Reusable skeleton:
+
+```sql
+-- Mobility query
+SELECT h3_index, hour, tipo_usuario,
+       SUM(total_usuarios_unicos) AS total_users
+FROM presentation.dim_mobility_data_by_hour
+WHERE cve_ent = '22'
+  AND h3_index IS NOT NULL
+GROUP BY h3_index, hour, tipo_usuario;
+```
+
+Python pipeline (compressed):
+```python
+df_mob["franja"] = df_mob["hour"].astype(int).map(asignar_franja)
+mask = (df_mob.franja == "morning") & (df_mob.mode_val == "peaton")
+agg  = df_mob[mask].groupby("h3_index").total_users.sum()
+
+# h3 → polygon → metric → overlay-once
+gdf_h3 = build_h3_gdf(agg.index)            # see §6
+intersected = gpd.overlay(gdf_buf, gdf_h3, how="intersection")
+intersected["w"] = (intersected.area / intersected["area_h3_m2"]).clip(0, 1)
+intersected["contrib"] = intersected.w * intersected.h3_id.map(agg)
+flow_per_block = intersected.groupby("cvegeo").contrib.sum()
+```
+
+**Failure modes.**
+- Forgetting to `GROUP BY h3_index, hour, tipo_usuario` — the table has multiple ingestion partitions per (hex, hour, mode), so summing without grouping double-counts.
+- Reprojecting H3 polygons but using their original (4326) area for the weight — divide by the **metric** area.
+- Buffer in 4326 — buffer in meters means project to 6372 first.
+
+### Case C — "POI density × competition by chain at AGEB grain"
+
+**Goal.** For every AGEB in a municipality, count weighted competing POIs (chain-aware).
+
+**Pattern.** AGEB geometry → POIs filtered by category → brand weight (`compute_brand_weights`) → spatial join (within or buffered).
+
+```sql
+SELECT g.cvegeo, g.geometry_coords_json AS geom
+FROM presentation.dim_mexico_geometries g
+WHERE g.geometry_level = 'ageb'
+  AND g.cve_ent = '22' AND g.cve_mun = '014'
+  AND g.geometry_coords_json IS NOT NULL;
+
+SELECT latitude::float, longitude::float, chain_name
+FROM presentation.dim_pois_dataplor
+WHERE cve_ent = '22' AND cve_mun = '014'
+  AND business_category IN ('restaurant')
+  AND latitude IS NOT NULL AND longitude IS NOT NULL;
+```
+
+Python (the brand-weight is the part most LLMs get wrong — see §5.2):
+```python
+w = compute_brand_weights(df_pois, alpha=1.0)   # canonical helper
+gdf_pois_m = to_metric(df_pois)                 # EPSG:6372
+joined = gpd.sjoin(gdf_pois_m, gdf_ageb_m, how="inner", predicate="within")
+joined["w"] = w[joined.index]
+weighted_count = joined.groupby("index_right").w.sum()
+```
+
+**Failure modes.**
+- Filtering POIs with `nomgeo` instead of `cve_mun` — see §2.4.
+- Counting `chain_name = 'None'` (string) as a real chain — that's the canonical Dataplor null encoding. Normalize first.
+- `sjoin` in 4326 — points will join, but any subsequent buffer/distance work breaks. Reproject before the join.
+
+### Case D — "Demand (spending) at AGEB joined to geometry, then overlaid on supply (POIs) for retail-gap"
+
+**Goal.** Brecha demanda–oferta por AGEB. Reference: `Gen_IDX_RetailGap.py`.
+
+**Demand query.** Already shown — `dim_spending_by_socioeconomic`, build cvegeo, filter by `expenditure_code` or `division_code`/`group_code`, sum NSE columns.
+
+**Supply.** `dim_pois_dataplor` filtered by `business_category` ∈ client categories. Brand-weighted via `compute_brand_weights`.
+
+**Gravitational accumulation.**
+```python
+# All in EPSG:6372 (meters)
+dx = cx_agebs[:, None] - cx_pois[None, :]
+dy = cy_agebs[:, None] - cy_pois[None, :]
+dist = np.sqrt(dx**2 + dy**2)
+decay = np.where(dist <= MAX_D, np.exp(-dist / D_SCALE), 0.0)
+accessible_supply = decay @ w_pois
+```
+
+**Merge.** `gdf_ageb.merge(df_spending, left_on="cvegeo", right_on="cvegeo_ageb", how="left")`. AGEBs without spending rows (parks, industrial zones) become 0, not NaN.
+
+**Failure modes.**
+- Forgetting `LEFT` on the merge — kills AGEBs without demand rows but with supply, which inflates RGI artifacts.
+- Chunking the distance matrix wrong — for >5k AGEBs, allocate `chunk_size=2000` AGEBs per block to keep RAM <100 MB.
+- `D_SCALE` and `MAX_D` differ across modules — the canonical pair across SCI / RGI is `D_SCALE=500, MAX_D=3000` (meters). Use these unless explicitly overridden.
+
+### Case E — "Cross-grain join: block-level idx (e.g. TMI) onto AGEB-level idx (e.g. SPI)"
+
+**Goal.** Carry a block-level index up to AGEB grain (or vice versa) so two indices computed at different resolutions can be aggregated.
+
+**Pattern.** Always **upsample to the finer grain, then aggregate to the coarser one**. Never the reverse — assigning AGEB values to all child blocks creates spurious within-AGEB variance.
+
+```python
+# Block → AGEB by population-weighted mean
+gdf_blocks["cvegeo_ageb"] = gdf_blocks["cvegeo"].str[:13]
+ageb_idx = (gdf_blocks
+            .assign(num=lambda d: d["pobtot"] * d["idx_block"])
+            .groupby("cvegeo_ageb")
+            .agg(num=("num","sum"), den=("pobtot","sum")))
+ageb_idx["idx_at_ageb"] = ageb_idx.num / ageb_idx.den.clip(lower=1)
+```
+
+**Failure modes.**
+- Simple mean instead of population-weighted mean — undercounts dense blocks.
+- Going AGEB → block by broadcasting the AGEB value to every block — see "never the reverse" above. If you must do this, document it as "constant-within-AGEB" and use it only for visualization, not for downstream stats.
+
+### Case F — "Pulling the geometry of the polygon that contains a point"
+
+**Goal.** Given `(lat, lon)`, return the block (or AGEB) that contains it.
+
+**Pattern.** Two options — Postgres-side (fast, recommended) or Python-side (only if the polygons are already in memory).
+
+Python-side, when you already have `gdf` of the municipality:
+```python
+sitio = Point(LON, LAT)
+hit = gdf[gdf.contains(sitio)]   # gdf in EPSG:4326, sitio in EPSG:4326
+```
+
+If `hit` is empty, the point is outside the municipality. Fall back to nearest centroid in EPSG:6372.
+
+---
+
+## 5. Recurring conventions worth standardizing
+
+### 5.1 The canonical normalization pipeline (intra-municipality)
+
+Every Gen_IDX produces a [0,1]-bounded `idx_*` column at the block (or AGEB) grain. The transformation chain is:
+
+1. **Raw count or score** `x ≥ 0`.
+2. **Density correction** `x_density = x / sqrt(area_km2_clip)` — penalizes large blocks. Area is clipped at `[0.000005, p99]` to protect against pathological geometries.
+3. **Winsorize** at p99 (skip if `>90%` zeros — sparse series get destroyed by winsorization).
+4. **Quantile-normalize** to [0,1] via `qnorm(s, p=0.95)` — divide by the p95, clip to [0,1]. p95 is chosen so the top 5% all read ≈ 1.0 (ceiling), and the rest spreads cleanly.
+5. **Sparse fallback.** If `>50%` (sometimes `>95%`) of the values are zero, the auto-transform returns `minmax(x)` instead, which preserves presence/absence semantics.
+
+For TMI specifically the chain is `rank(raw / sqrt(area_km2), pct=True)` — rank-percentile is preferred over minmax because the raw flow distribution has IQR/range ratios that compress badly under linear scaling in dense urban municipalities.
+
+For SCI/RGI, the spatial-decay accumulation `C_i = Σ_j w_j × exp(−D_ij / D_SCALE)` already controls outliers, so winsorization is skipped and the chain becomes `qnorm(log(1+C_i) / sqrt(area_clip))`.
+
+### 5.2 Brand weights for chain-aware POI counting
+
+`compute_brand_weights(df_pois, alpha=1.0)` returns a length-N array of weights ≥ 1.0 per POI:
+
+```
+w_j = 1 + alpha · ln(1 + n_j) / ln(1 + n_p95)
+```
+
+where `n_j` is the count of POIs sharing `chain_name` in this municipality, and `n_p95` is the p95 of `n_j`. Independents (chain_name in `{None, '', 'NULL', 'None', 'n/a', ...}`) get `w_j = 1.0`.
+
+**Always normalize the null-stand-ins before counting.** The string literal `'None'` is the most common Dataplor null encoding, and if you treat it as a chain it becomes the largest "chain" in the data and inflates every weight.
+
+### 5.3 Site-level aggregation via buffered manzana mean
+
+When a sub-index is computed at block grain but the consumer is a site (point), the site value is the **mean of the index over blocks whose centroid is within `BUFFER_SITIO_M` of the point**. Default `BUFFER_SITIO_M = 500 m` (LCI) or `BUFFER_M = 500 m` (TMI). Treat as configurable per pillar.
+
+### 5.4 Site Score aggregation formula
+
+From `Agg_Site_Score.py`:
+
+```
+ACC_score  = 100 × LCI                                            (LCI = 0.5·idx_drive + 0.5·idx_walk)
+MKT_score  = 100 × (0.5 × TMI + 0.5 × MSI)
+COMP_raw   = 0.65 × balance_norm + 0.35 × intensity
+             where balance = synergy − pressure (rescaled to [0,1])
+COMP_score = 100 × COMP_raw          (clip [0,100])
+
+SITE_score = 0.25 × ACC_score + 0.40 × MKT_score + 0.35 × COMP_score
+```
+
+The 0.65/0.35 split for COMP avoids the degenerate "dead-zone scores 50" failure mode that pure-balance produces when both synergy and pressure are zero.
+
+---
+
+## 6. Helpers every module re-implements (and that should eventually be a shared lib)
+
+These functions appear copy-pasted in every Gen_IDX. If you're writing a new analysis, copy them rather than redefine.
+
+```python
+def parse_coords_json(raw):
+    """dim_mexico_geometries.geometry_coords_json → shapely Polygon|MultiPolygon."""
+    coords = raw if isinstance(raw, list) else json.loads(raw)
+    if isinstance(coords[0], (list,tuple)) and isinstance(coords[0][0], (int,float)):
+        return Polygon(coords)
+    if isinstance(coords[0][0], (list,tuple)) and isinstance(coords[0][0][0], (int,float)):
+        return Polygon(coords[0], coords[1:] if len(coords)>1 else [])
+    if isinstance(coords[0][0][0], (list,tuple)):
+        return MultiPolygon([Polygon(r[0], r[1:]) for r in coords])
+    return None
+
+def h3_to_polygon(h3_id):
+    """h3 cell → shapely Polygon in EPSG:4326. Note h3 returns (lat, lon)."""
+    boundary = h3.cell_to_boundary(h3_id)
+    return Polygon([(lon, lat) for lat, lon in boundary])
+
+def winsorize(s, p=0.99):
+    if (s == 0).mean() > 0.90: return s, s.max()
+    cap = s.quantile(p);       return s.clip(upper=cap), cap
+
+def qnorm(s, p=0.95):
+    cap = s.quantile(p)
+    return (s/cap).clip(0,1) if cap > 0 else pd.Series(0.0, index=s.index)
+
+def sql_in(lst):
+    escaped = [str(v).replace("'", "''") for v in lst]
+    return "(" + ", ".join(f"'{v}'" for v in escaped) + ")"
+```
+
+---
+
+## 7. Failure-mode quick reference
+
+| Symptom | Most likely cause |
+|---|---|
+| `0 manzanas` returned | Wrong `ENTIDAD` for the municipio; `nom_mun` typo (use the INEGI literal, with accents). |
+| All `idx_*` ≈ 0 | Sparse regime not detected — the auto-transform fell into the dense branch on a >95%-zero series. |
+| Mobility values 10× too high | Forgot `GROUP BY h3_index, hour, tipo_usuario` in the mobility query. |
+| Distances are tiny decimals | Working in EPSG:4326. Reproject to EPSG:6372 before any `.distance()` or `.buffer(meters)`. |
+| Site point falls outside every polygon | Geometry filter pruned the boundary block; widen `BBOX_MARGIN_DEG` or fall back to nearest centroid. |
+| RGI is NaN for many AGEBs | Used inner merge between geometry and spending; switch to `how="left"` and treat missing as 0. |
+| One chain dominates every weight | Didn't normalize the `'None'` string in `chain_name`. |
+| Score collapses to 0.5 in dead zones | Using minmax on a balance score with zero variance — replace with the 0.65/0.35 COMP_raw formula. |
+| `nomgeo`-based POI filter returns the wrong city's POIs | Homonymous municipalities — switch the filter to `cve_ent` + `cve_mun`. |
+
+---
+
+## 8. What this DB cannot do (yet)
+
+For honesty with downstream LLMs:
+
+- **No origin–destination matrix table.** The OD matrix is computed offline from raw pings (not in `presentation`). Until it lands, every mobility-derived index uses the H3-aggregated counts in `dim_mobility_data_by_hour|day`.
+- **No per-POI visit counts.** `dim_pois_dataplor` has location and metadata but not visit traffic. Use mobility hex flow as a proxy until the OD matrix is wired.
+- **No time series for population/NSE.** `dim_demographic_by_block_locality` is a snapshot (Censo). Don't write queries that expect a date.
+- **No cross-municipality benchmarking layer.** Indices are normalized within-municipality; comparing `idx_mobility = 0.8` in Querétaro to `0.8` in Mérida is structurally wrong without an additional inter-municipality normalization pass that does not yet exist.
+
+---
+
+## 9. Quick reference card
+
+```
+GEOMETRY        : presentation.dim_mexico_geometries        (key: cvegeo + geometry_level + cve_ent)
+DEMOGRAPHICS    : presentation.dim_demographic_by_block_locality   (compose cvegeo from entidad/mun/loc/ageb/mza)
+NSE INCOME TIER : presentation.dim_socioeconomic_level_ageb_locality (key: geo_code = AGEB cvegeo, 13 chars)
+POIs            : presentation.dim_pois_dataplor            (filter: cve_ent + cve_mun + business_category)
+MOBILITY HOUR   : presentation.dim_mobility_data_by_hour    (key: h3_index + cve_ent;  H3 res 10)
+MOBILITY DAY    : presentation.dim_mobility_data_by_day     (same; aggregate by day)
+SPENDING ENIGH  : presentation.dim_spending_by_socioeconomic (compose cvegeo_ageb; filter expenditure_code OR division/group)
+
+ALWAYS:
+  - filter dim_mexico_geometries by geometry_level AND cve_ent
+  - filter POIs by cve_ent + cve_mun (never nomgeo alone)
+  - reproject to EPSG:6372 before any metric operation
+  - normalize chain_name null stand-ins before counting
+
+CRS:
+  EPSG:4326 for I/O, plotting, lat/lon columns
+  EPSG:6372 for areas, distances, buffers, centroids, sjoin radii
+```

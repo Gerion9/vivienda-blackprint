@@ -1,0 +1,31 @@
+# Next.js build and dependency files
+node_modules/
+.next/
+out/
+
+# Environment files (sensitive credentials)
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Python files
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+.env/
+
+# IDE and OS metadata
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
