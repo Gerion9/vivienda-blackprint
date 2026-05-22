@@ -54,11 +54,13 @@ export default function Login() {
       </Head>
 
       <div className="login-card">
-        <div className="login-emblem">
-          <img src="/brand/blackprint-emblem-light.png" alt="BlackPrint" />
-        </div>
         <div className="login-lockup">
-          <span className="lk-cross">×</span>
+          <img
+            src="/brand/blackprint-emblem-light.png"
+            alt="BlackPrint"
+            className="lockup-bp"
+          />
+          <span className="lk-cross" aria-hidden="true">×</span>
           <span className="lk-orange">
             <img src="/brand/orange-logo.png" alt="" className="orange-logo" aria-hidden="true" />
             <span className="orange-name">Orange</span>
@@ -173,32 +175,29 @@ export default function Login() {
           to   { opacity: 1; transform: none; }
         }
 
-        .login-emblem {
-          display: flex;
-          justify-content: center;
-          margin-bottom: 18px;
-        }
-        .login-emblem img {
-          height: 44px;
-          width: auto;
-          filter: brightness(0);
-          opacity: 0.88;
-        }
-
         .login-lockup {
           display: flex;
           align-items: center;
           justify-content: center;
-          gap: 10px;
-          margin-bottom: 24px;
+          gap: 16px;
+          margin-bottom: 30px;
           font-family: var(--font-ui);
           font-size: 14px;
         }
+        .lockup-bp {
+          height: 24px;
+          width: auto;
+          display: block;
+          filter: brightness(0);
+          opacity: 0.88;
+        }
         .lk-cross {
           color: var(--ink-mute);
-          font-size: 18px;
+          font-size: 20px;
           font-weight: 300;
           line-height: 1;
+          user-select: none;
+          letter-spacing: 0;
         }
         .lk-orange {
           display: inline-flex;
